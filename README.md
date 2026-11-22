@@ -7,7 +7,7 @@
 - 登录批次
 - 内存预算
 - 有界归并
-- 上架顺序单
+- 上架顺序单（分段存档、翻页、校验导出与旧数据迁移）
 
 ## 本地运行
 
@@ -34,6 +34,16 @@ docker compose up -d --build --wait
 | `viewer` | 观察员 | 读取、导出已有结果 |
 
 `SEED_DEMO=true` 启动时生成账号与一个业务样例。工作台新建档案会预填样例。可编辑表单中的数值、文本和结构化 JSON 后提交。业务说明中的原始文件是上游示例，演示数据通过表单录入。角色枚举位于后端 `src/constants/workflow.py` 与前端 `src/constants/workflow.js`。执行状态枚举也位于这两个文件，使用于队列、列表和执行详情。证据校验码是报告 JSON 按 UTF-8、键排序且省略多余空格序列化后的 SHA-256。
+
+上架顺序单在证据页面按段翻页，并用「导出顺序单」按原始 JSONL 整单导出（响应头 `X-Order-Checksum` 为整单 SHA-256）。经办员可在同一页面分批迁移旧顺序单，`POST /orders/migrate?batch_size=10` 等价于页面按钮。
+
+本地后端测试使用 SQLite，不依赖 PostgreSQL 与 Redis：
+
+```sh
+cd backend
+pip install -r requirements.txt pytest httpx
+python -m pytest tests -q
+```
 
 ## 工程结构
 

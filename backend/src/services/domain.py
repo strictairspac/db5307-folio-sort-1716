@@ -17,6 +17,7 @@ SPEC = {
         "batch_no": "登录批次号",
         "run_bytes": "初始段内存预算（字节）",
         "fan_in": "每组最多归并段数",
+        "segment_items": "存档每段件数",
         "records": "交接清册",
         "item_id": "馆藏件号",
         "accession_no": "馆藏登录号",
@@ -25,11 +26,13 @@ SPEC = {
     "guidance": (
         "按交接清册原顺序录入馆藏件。登录号形如 GJ-2026-2 或 GJ-2026-2-1，"
         "按馆藏代码、年份、流水号和分册号排序。初始段预算按 UTF-8 字节计，归并上限为 2 至 32 段。"
+        "上架顺序单按「存档每段件数」分段存档，工作台翻页只读覆盖该页的段。"
     ),
     "sample": {
         "batch_no": "WX-20261121-AM",
         "run_bytes": 110,
         "fan_in": 2,
+        "segment_items": 2,
         "records": [
             {"item_id": "BX-01", "accession_no": "GJ-2026-10", "title": "江南舆图"},
             {"item_id": "BX-02", "accession_no": "GJ-2026-002", "title": "海盐县志"},
@@ -73,7 +76,7 @@ def _read_text(value: object, label: str) -> str:
     return value
 
 
-def _batch_inputs(payload: object) -> tuple[str, int, int, list]:
+def _batch_inputs(payload: object) -> tuple[str, int, int, int, list]:
     if not isinstance(payload, dict):
         raise ValueError("登录批次必须是对象")
     batch_no = _read_text(payload.get("batch_no"), "登录批次号")
@@ -87,10 +90,13 @@ def _batch_inputs(payload: object) -> tuple[str, int, int, list]:
     fan_in = payload.get("fan_in")
     if type(fan_in) is not int or not 2 <= fan_in <= 32:
         raise ValueError("每组最多归并段数必须是 2 至 32 之间的整数")
+    segment_items = payload.get("segment_items", 64)
+    if type(segment_items) is not int or not 1 <= segment_items <= 10000:
+        raise ValueError("存档每段件数必须是 1 至 10000 之间的整数")
     records = payload.get("records")
     if not isinstance(records, list):
         raise ValueError("交接清册必须是记录数组")
-    return batch_no, run_bytes, fan_in, records
+    return batch_no, run_bytes, fan_in, segment_items, records
 
 
 def _entries(records: list, run_bytes: int) -> Iterator[Entry]:
@@ -131,13 +137,13 @@ def _row_from_line(rank: int, line: bytes) -> dict[str, str | int]:
 
 
 def validate(payload):
-    _, run_bytes, _, records = _batch_inputs(payload)
+    _, run_bytes, _, _, records = _batch_inputs(payload)
     for _ in _entries(records, run_bytes):
         pass
 
 
 def solve(payload, engine):
-    batch_no, run_bytes, fan_in, records = _batch_inputs(payload)
+    batch_no, run_bytes, fan_in, segment_items, records = _batch_inputs(payload)
     order, phases = sort_on_disk(
         _entries(records, run_bytes),
         run_bytes=run_bytes,
@@ -145,6 +151,7 @@ def solve(payload, engine):
         key_from_line=_key_from_line,
         row_from_line=_row_from_line,
     )
+    archived_segments = (len(order) + segment_items - 1) // segment_items
     metrics = {
         "上架件数": len(order),
         "初始磁盘段数": phases[0].output_runs,
@@ -153,6 +160,8 @@ def solve(payload, engine):
         "峰值归并输入段数": max(phase.max_fan_in for phase in phases),
         "磁盘读取字节": sum(phase.bytes_read for phase in phases),
         "磁盘写入字节": sum(phase.bytes_written for phase in phases),
+        "存档段数": archived_segments,
+        "每段件数": segment_items,
     }
     evidence = [
         {
@@ -177,6 +186,8 @@ def solve(payload, engine):
     return {
         "summary": summary,
         "metrics": metrics,
+        "order": {"format": "jsonl-v1", "segments": archived_segments,
+                  "segment_items": segment_items, "records": len(order)},
         "sections": [
             {"title": "上架顺序单", "rows": order},
             {"title": "磁盘读写与归并记录", "rows": evidence},

@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import uuid
 
 from fastapi import HTTPException
@@ -7,7 +8,7 @@ from sqlalchemy import and_, or_, select
 from src.config.settings import cache, engine
 from src.constants.workflow import Status
 from src.models.tables import audit, cases, evidence, runs
-from src.services import domain
+from src.services import domain, orders
 from src.utils.encoding import canonical
 from src.utils.time import utc_time
 
@@ -19,6 +20,25 @@ def log(conn, actor, action, reference):
 def recent(table):
     with engine.connect() as conn:
         return [dict(row) for row in conn.execute(select(table).order_by(table.c.id.desc()).limit(100)).mappings()]
+
+
+def recent_evidence():
+    """证据列表只带摘要与指标，上架顺序单独自由 /orders/{key}/page 分段读取。"""
+    with engine.connect() as conn:
+        rows = conn.execute(select(evidence).order_by(evidence.c.id.desc()).limit(100)).mappings()
+        result = []
+        for row in rows:
+            item = dict(row)
+            report = item.get('report') if isinstance(item.get('report'), dict) else {}
+            item['report'] = {
+                'summary': report.get('summary', ''),
+                'metrics': report.get('metrics', {}),
+                'order': report.get('order', {}),
+                'sections': [section for section in report.get('sections', [])
+                             if isinstance(section, dict) and section.get('title') != orders.ORDER_SECTION],
+            }
+            result.append(item)
+        return result
 
 
 def found(conn, table, identity):
@@ -80,13 +100,30 @@ def finish(run_id, token, result=None, error=None):
     digest = hashlib.sha256(canonical(result)).hexdigest() if result is not None else None
     status = Status.FAILED if error else Status.COMPLETE
     with engine.begin() as conn:
+        row = conn.execute(select(runs.c.case_id).where(runs.c.id == run_id)).first()
         count = conn.execute(runs.update().where(runs.c.id == run_id,
                         runs.c.attempt_token == token, runs.c.status == Status.RUNNING)
                         .values(status=status, finished_at=utc_time(), error=error)).rowcount
         if not count:
             return
         if result is not None:
-            conn.execute(evidence.insert().values(run_id=run_id, report=result, digest=digest))
+            evidence_id = conn.execute(evidence.insert().values(
+                run_id=run_id, report=result, digest=digest)).inserted_primary_key[0]
+            payload = conn.execute(select(cases.c.payload).where(
+                cases.c.id == row.case_id)).scalar_one() if row else {}
+            batch_no = payload.get('batch_no') if isinstance(payload, dict) else None
+            try:
+                # 存档走独立保存点：写段失败只回滚存档，不影响已完成的执行与证据。
+                with conn.begin_nested():
+                    orders.archive_report(conn, result, str(batch_no or f'run-{run_id}'), payload,
+                                          orders.evidence_key(evidence_id),
+                                          source='run', evidence_id=evidence_id)
+            except orders.OrderCorrupt:
+                # 排序结果本身已校验；存档失败不覆盖执行结论，可由迁移任务补齐。
+                pass
+            except Exception:
+                # 顺序单存档是附加能力，任何存档异常都不应让已完成的执行回滚。
+                logging.exception('Order archiving failed for run %s', run_id)
         log(conn, 'worker', status.value, run_id)
 
 
